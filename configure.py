@@ -12,12 +12,14 @@
 # Append --help to see available options.
 ###
 
-import sys
 import argparse
-
+import sys
 from pathlib import Path
+from typing import Any, Dict, List
+
 from tools.project import (
     Object,
+    ProgressCategory,
     ProjectConfig,
     calculate_progress,
     generate_build,
@@ -30,97 +32,144 @@ VERSIONS = [
     "GM8E01",	# 0
 ]
 
-if len(VERSIONS) > 1:
-    versions_str = ", ".join(VERSIONS[:-1]) + f" or {VERSIONS[-1]}"
-else:
-    versions_str = VERSIONS[0]
+DISABLED_VERSIONS = [
+]
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "mode",
+    choices=["configure", "progress"],
     default="configure",
-    help="configure or progress (default: configure)",
+    help="script mode (default: configure)",
     nargs="?",
 )
 parser.add_argument(
+    "-v",
     "--version",
-    dest="version",
+    choices=VERSIONS,
+    type=str.upper,
     default=VERSIONS[DEFAULT_VERSION],
-    help=f"version to build ({versions_str})",
+    help="version to build",
 )
 parser.add_argument(
     "--build-dir",
-    dest="build_dir",
+    metavar="DIR",
     type=Path,
     default=Path("build"),
     help="base build directory (default: build)",
 )
 parser.add_argument(
+    "--binutils",
+    metavar="BINARY",
+    type=Path,
+    help="path to binutils (optional)",
+)
+parser.add_argument(
     "--compilers",
-    dest="compilers",
+    metavar="DIR",
     type=Path,
     help="path to compilers (optional)",
 )
 parser.add_argument(
     "--map",
-    dest="map",
     action="store_true",
     help="generate map file(s)",
 )
 parser.add_argument(
     "--debug",
-    dest="debug",
     action="store_true",
     help="build with debug info (non-matching)",
 )
 if not is_windows():
     parser.add_argument(
         "--wrapper",
-        dest="wrapper",
+        metavar="BINARY",
         type=Path,
         help="path to wibo or wine (optional)",
     )
 parser.add_argument(
-    "--build-dtk",
-    dest="build_dtk",
+    "--dtk",
+    metavar="BINARY | DIR",
     type=Path,
-    help="path to decomp-toolkit source (optional)",
+    help="path to decomp-toolkit binary or source (optional)",
+)
+parser.add_argument(
+    "--objdiff",
+    metavar="BINARY | DIR",
+    type=Path,
+    help="path to objdiff-cli binary or source (optional)",
 )
 parser.add_argument(
     "--sjiswrap",
-    dest="sjiswrap",
+    metavar="EXE",
     type=Path,
     help="path to sjiswrap.exe (optional)",
 )
 parser.add_argument(
+    "--ninja",
+    metavar="BINARY",
+    type=Path,
+    help="path to ninja binary (optional)",
+)
+parser.add_argument(
     "--verbose",
-    dest="verbose",
     action="store_true",
     help="print verbose output",
+)
+parser.add_argument(
+    "--non-matching",
+    dest="non_matching",
+    action="store_true",
+    help="builds equivalent (but non-matching) or modded objects",
+)
+parser.add_argument(
+    "--warn",
+    dest="warn",
+    type=str,
+    choices=["all", "off", "error"],
+    help="how to handle warnings",
+)
+parser.add_argument(
+    "--no-progress",
+    dest="progress",
+    action="store_false",
+    help="disable progress calculation",
 )
 args = parser.parse_args()
 
 config = ProjectConfig()
-config.version = args.version.upper()
-if config.version not in VERSIONS:
-    sys.exit(f"Invalid version '{config.version}', expected {versions_str}")
+config.version = str(args.version)
 version_num = VERSIONS.index(config.version)
+
+if version_num in DISABLED_VERSIONS:
+    print(f"Version {VERSIONS[version_num]} is disabled using default")
+    version_num = DEFAULT_VERSION
+    config.version = VERSIONS[DEFAULT_VERSION]
 
 # Apply arguments
 config.build_dir = args.build_dir
-config.build_dtk_path = args.build_dtk
+config.dtk_path = args.dtk
+config.objdiff_path = args.objdiff
+config.binutils_path = args.binutils
 config.compilers_path = args.compilers
-config.debug = args.debug
 config.generate_map = args.map
+config.non_matching = args.non_matching
 config.sjiswrap_path = args.sjiswrap
+config.ninja_path = args.ninja
+config.progress = args.progress
 if not is_windows():
     config.wrapper = args.wrapper
+# Don't build asm unless we're --non-matching
+if not config.non_matching:
+    config.asm_dir = None
 
 # Tool versions
-config.compilers_tag = "1"
-config.dtk_tag = "v0.5.6"
-config.sjiswrap_tag = "v1.1.1"
-config.wibo_tag = "0.6.3"
+config.binutils_tag = "2.42-1"
+config.compilers_tag = "20251118"
+config.dtk_tag = "v1.8.3"
+config.objdiff_tag = "v3.7.0"
+config.sjiswrap_tag = "v1.2.2"
+config.wibo_tag = "1.0.3"
 
 # Project
 config.config_path = Path("config") / config.version / "config.yml"
@@ -157,7 +206,7 @@ cflags_base = [
 ]
 
 # Debug flags
-if config.debug:
+if args.debug:
     cflags_base.extend(["-sym on", "-DDEBUG=1"])
 else:
     cflags_base.append("-DNDEBUG=1")
@@ -247,12 +296,47 @@ config.libs = [
     ),
 ]
 
+# Optional callback to adjust link order. This can be used to add, remove, or reorder objects.
+# This is called once per module, with the module ID and the current link order.
+#
+# For example, this adds "dummy.c" to the end of the DOL link order if configured with --non-matching.
+# "dummy.c" *must* be configured as a Matching (or Equivalent) object in order to be linked.
+def link_order_callback(module_id: int, objects: List[str]) -> List[str]:
+    # Don't modify the link order for matching builds
+    return objects
+
+
+# Uncomment to enable the link order callback.
+# config.link_order_callback = link_order_callback
+
+
+# Optional extra categories for progress tracking
+# Adjust as desired for your project
+config.progress_categories = [
+    ProgressCategory("game", "Game"),
+    ProgressCategory("core", "Core Engine (Kyoto)"),
+    ProgressCategory("sdk", "SDK"),
+    ProgressCategory("third_party", "Third Party"),
+]
+config.progress_each_module = args.verbose
+# Optional extra arguments to `objdiff-cli report generate`
+config.progress_report_args = [
+    # Marks relocations as mismatching if the target value is different
+    # Default is "functionRelocDiffs=none", which is most lenient
+    # "--config functionRelocDiffs=data_value",
+]
+config.progress_modules = False
+config.progress_use_fancy = True
+config.progress_code_fancy_frac = 1499
+config.progress_code_fancy_item = "Energy"
+config.progress_data_fancy_frac = 250
+config.progress_data_fancy_item = "Missiles"
+
 if args.mode == "configure":
     # Write build.ninja and objdiff.json
     generate_build(config)
 elif args.mode == "progress":
-    # Print progress and write progress.json
-    config.progress_each_module = args.verbose
+    # Print progress information
     calculate_progress(config)
 else:
     sys.exit("Unknown mode: " + args.mode)
